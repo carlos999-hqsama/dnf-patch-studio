@@ -10,8 +10,8 @@ import type { ImportMeta } from './import';
 import { SpriteSet, type Cell, type RGBA } from './model';
 import type { Geometry } from './geometry';
 import {
-  openSubject, resegmentSubject, renderActionSegment, importActionSegment, deploySubject,
-  listSkins, listHideSources, filterSubjects, type OpenSubject, type SubjectEntry,
+  openSubject, setGrid, renderActionSegment, importActionSegment, deploySubject,
+  listSkins, listHideSources, filterSubjects, type OpenSubject, type SubjectEntry, type GridSpec,
 } from './workflow';
 import { parseSkin, hidePatchName, type SubjectType } from './dnf-rules';
 import { readNpk, writePatch, pickImagePacksDir, listFileNames, type FsaDirHandle } from './fs-access';
@@ -33,6 +33,15 @@ type Algo = 'floodkey' | 'floodbg';
 // 但【暂隐藏不暴露】—— 怪物/宠物非标准人形, 玩家拿导出网格去 AI 重绘出不了能用的结果 (三九 0618 决定)。
 // 代码全保留(workflow.openSubject 等通用), 要恢复把 ['monster','怪物'],['pet','宠物'] 加回本表即可。
 const TYPE_DEFS: [SubjectType, string][] = [['class', '职业']];
+
+// 导出网格预设(下拉)。默认 4×4·16; 3×3 格大、AI 出图更稳; 留空=末格(右下)空着给 Gemini/nano banana 水印砸。
+const GRID_PRESETS: { key: string; label: string; spec: GridSpec }[] = [
+  { key: '4x4', label: '4×4 · 16 帧（满）', spec: { cols: 4, rows: 4, segSize: 16 } },
+  { key: '4x4b', label: '4×4 · 15 帧（留空避水印）', spec: { cols: 4, rows: 4, segSize: 15 } },
+  { key: '3x3', label: '3×3 · 9 帧（格大 · AI 更稳）', spec: { cols: 3, rows: 3, segSize: 9 } },
+  { key: '3x3b', label: '3×3 · 8 帧（留空避水印）', spec: { cols: 3, rows: 3, segSize: 8 } },
+];
+const gridSpecOf = (key: string): GridSpec => (GRID_PRESETS.find((p) => p.key === key) ?? GRID_PRESETS[0]!).spec;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag);
@@ -152,7 +161,7 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
   let rightBg: BgChoice = BG_PRESETS[0]!;
   let algo: Algo = 'floodkey';
   let despill = true;
-  let blank16 = false;                       // 「16格放空」: 默认关(占满4×4=16帧); 开→每组15帧, 右下留空给水印
+  let gridKey = '4x4';                       // 导出网格预设 key (见 GRID_PRESETS), 默认 4×4·16
   const importedKeys = new Set<string>();    // `${action}:${seg}` 已导入完成
   const rawAiByKey = new Map<string, RGBA>(); // `${action}:${seg}` → 上传的原始 AI 图 (改算法重抠)
 
@@ -322,6 +331,7 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
     const gridCol = el('div', 'bggrid-col');
     if (open && cur) {
       const grid = el('div', 'bggrid');
+      grid.style.gridTemplateColumns = `repeat(${open.gridCols}, 1fr)`; // 显示列数随导出网格 (3 或 4)
       for (const [gr, im] of cur.cells) {
         const fr = cur.ss.get(gr, im);
         grid.appendChild(gridCell(fr?.img ? renderCellContentFit(fr.img as ImageData, cur.geo) : null, leftBg.css));
@@ -352,17 +362,21 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
       side.appendChild(prev);
       if (open.actions.length > 1) { side.appendChild(el('span', 'lbl', `动作 (${open.actions.length})`)); side.appendChild(actionNav()); }
       const o = open, g = cur;
-      // 16 格放空: 默认关(占满 4×4); 勾上 → 每组 15 帧、右下第16格留空, 应对 Gemini/nano banana 水印。
-      const blankRow = el('label', 'chkrow');
-      const cb16 = el('input'); cb16.type = 'checkbox'; cb16.checked = blank16;
-      cb16.addEventListener('change', () => {
-        blank16 = cb16.checked;
-        resegmentSubject(o, blank16 ? 15 : 16);
+      // 导出网格下拉: 3×3 格大、AI 出图更稳 / 4×4 塞更多帧但每格小。切换 → setGrid 重设网格+重分组, 已换帧保留。
+      side.appendChild(el('span', 'lbl', '导出网格'));
+      const gsel = el('select', 'sel');
+      for (const p of GRID_PRESETS) {
+        const opt = el('option', undefined, p.label); opt.value = p.key;
+        if (p.key === gridKey) opt.selected = true;
+        gsel.appendChild(opt);
+      }
+      gsel.addEventListener('change', () => {
+        gridKey = gsel.value;
+        setGrid(o, gridSpecOf(gridKey));
         curSeg = 0; cur = null; curForKey = ''; rawAiByKey.clear(); rebuildImportedKeys();
         void renderBoth();
       });
-      blankRow.append(cb16, document.createTextNode(' 16 格放空（应对 gemini 水印）'));
-      side.appendChild(blankRow);
+      side.appendChild(gsel);
       const dl = el('button', 'btn block', '导出素材图');
       dl.addEventListener('click', () => g.exportCanvas.toBlob((bl) => {
         if (!bl) return;
@@ -394,6 +408,7 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
     if (open && cur) {
       const o = open, g = cur;
       const grid = el('div', 'bggrid dropzone');
+      grid.style.gridTemplateColumns = `repeat(${o.gridCols}, 1fr)`; // 显示列数随导出网格 (3 或 4)
       for (const [gr, im] of g.cells) {
         const fr = o.replaced.get(`${gr},${im}`);
         grid.appendChild(gridCell(fr ? renderCellContentFit(toImageData(fr.img), g.geo) : null, rightBg.css, '拖重绘图到这'));
@@ -504,7 +519,7 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
     try {
       const eng = await getEngine();
       const srcNpk = await readNpk(dir, entry.fileName);
-      open = await openSubject(eng, srcNpk, entry.fileName, blank16 ? 15 : 16);
+      open = await openSubject(eng, srcNpk, entry.fileName, gridSpecOf(gridKey));
       curAction = 0; curSeg = 0; cur = null; curForKey = '';
       importedKeys.clear(); rawAiByKey.clear();
       await renderBoth();

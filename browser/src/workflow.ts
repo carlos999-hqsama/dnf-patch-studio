@@ -19,9 +19,10 @@ import {
 } from './dnf-rules';
 import { type FsaDirHandle } from './fs-access';
 
-export const GRID_COLS = 4, GRID_ROWS = 4; // 固定 4×4 网格 (16 格)
-// 每组帧数: 默认 16 占满 4×4; 用户勾「16格放空」→ 15, 右下第16格留空给 Gemini/nano banana 水印(导入丢弃)。
-export const SEG_FULL = 16, SEG_BLANK16 = 15;
+// 导出网格规格 (用户在「导出网格」下拉选, 默认 4×4·16): 3×3 格大、AI 出图更稳; 4×4 塞更多帧但每格小、AI 易不稳。
+// segSize < cols*rows = 末格(右下)留空, 给 Gemini/nano banana 水印砸(导入丢弃)。
+export interface GridSpec { cols: number; rows: number; segSize: number; }
+export const DEFAULT_GRID: GridSpec = { cols: 4, rows: 4, segSize: 16 };
 // nano banana(Gemini Flash Image)图生图甜区: 输入按 768 切片、出图 1K-2K, 太小细节不足。
 // 内容贴合 cell≈142×146, ×3 → 每格~430px、3×3 网格≈1.3-1.4Kpx (PNG, 近 1:1; 编辑模式保留输入画布原样改)。
 export const EXPORT_UPSCALE = 3;   // NEAREST 放大倍数 (整数→像素均匀锐利)
@@ -116,6 +117,7 @@ export interface OpenSubject {
   pngByFile: Map<string, Uint8Array>;    // file → PNG; 按动作懒填
   loadedImgs: Set<number>;               // 已解像素的 IMG (懒解去重)
   replaced: Map<string, ImportedFrame>;  // "g,i" → 替换帧 (跨动作累积; g=img_index 故不撞)
+  gridCols: number; gridRows: number;    // 当前导出网格(3 或 4); 渲染导出图 + 显示网格列数用, setGrid 切换时更新
 }
 
 /** 从 manifest 收一个 IMG 的 size/axis + cells + file 映射 (不解像素, 写进传入的 ss/fileByCell)。 */
@@ -147,7 +149,7 @@ function imgShortName(fullName: string): string {
 }
 
 /** 解一个对象 (职业/怪物/宠物) → 多动作元数据 (不解像素, 秒回)。像素按动作懒解 (renderActionSegment 内部触发)。 */
-export async function openSubject(eng: AsyncEngine, srcNpk: Uint8Array, fileName: string, segSize: number = SEG_FULL): Promise<OpenSubject> {
+export async function openSubject(eng: AsyncEngine, srcNpk: Uint8Array, fileName: string, grid: GridSpec = DEFAULT_GRID): Promise<OpenSubject> {
   const type = subjectType(fileName);
   if (!type) throw new Error(`不是可补丁对象 (职业/怪物/宠物): ${fileName}`);
   const manifest = await eng.unpackMeta(srcNpk);
@@ -158,20 +160,22 @@ export async function openSubject(eng: AsyncEngine, srcNpk: Uint8Array, fileName
     const cells = collectImg(manifest, img, metaSS, fileByCell);
     if (!cells.length) continue;
     const name = imgName(manifest, img);
-    actions.push(buildAction(metaSS, cells, img, imgShortName(name), isEffectImg(name), segSize));
+    actions.push(buildAction(metaSS, cells, img, imgShortName(name), isEffectImg(name), grid.segSize));
   }
   return {
     type, fileName, zh: subjectZh(fileName, type), srcNpk, manifest, actions,
     metaSS, fileByCell, pngByFile: new Map(), loadedImgs: new Set(), replaced: new Map(),
+    gridCols: grid.cols, gridRows: grid.rows,
   };
 }
 
-/** 改每组帧数(切「16格放空」时)重新分组。只重算 segments(纯 manifest 元数据), 不动像素/已换帧
+/** 切「导出网格」时重设网格 + 重新分组。只重算 cols/rows/segments(纯 manifest 元数据), 不动像素/已换帧
  *  → 已重绘的帧(open.replaced 按 img,frame 存, 与分组无关)全保留。 */
-export function resegmentSubject(open: OpenSubject, segSize: number): void {
+export function setGrid(open: OpenSubject, grid: GridSpec): void {
+  open.gridCols = grid.cols; open.gridRows = grid.rows;
   for (const a of open.actions) {
     const action: Action = { id: a.imgIndex, name: a.name, frames: a.cells.map(([g, i]) => [g, i, 0, 0, 6] as const) };
-    a.segments = segmentAction(action, segSize, false).map((s) => s.keys);
+    a.segments = segmentAction(action, grid.segSize, false).map((s) => s.keys);
   }
 }
 
@@ -198,7 +202,7 @@ export async function renderActionSegment(
     if (!png || !m) continue;
     ss.set({ group: g, image: i, size: m.size, axis: m.axis, img: await decodePng(png) });
   }
-  const { canvas, meta } = buildActionGridCanvas(ss, cells, action.geo, { upscale: EXPORT_UPSCALE, gap: EXPORT_GAP, pad: EXPORT_PAD, bg, cols: GRID_COLS, rows: GRID_ROWS });
+  const { canvas, meta } = buildActionGridCanvas(ss, cells, action.geo, { upscale: EXPORT_UPSCALE, gap: EXPORT_GAP, pad: EXPORT_PAD, bg, cols: open.gridCols, rows: open.gridRows });
   meta.targetH = action.targetH; meta.baseDX = action.baseDX; meta.baseDY = action.baseDY;
   return { canvas, meta, geo: action.geo, cells, ss };
 }
