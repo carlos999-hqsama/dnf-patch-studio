@@ -13,3 +13,4 @@ browser/test/fixtures/*.NPK
 browser/public/*.NPK
 browser/dist/
 .claude/
+browser/public/redraw*.jpg

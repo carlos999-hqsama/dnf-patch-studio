@@ -1,10 +1,14 @@
 // 开发自检入口 (PoC) — 把阶段 1/2 的验证脚手架 (解包显示 / core 对齐渲染 / 补丁闭环 / OPFS 数据流)
 // 收成一处, 与产品工作台 (workbench) 隔离。这些按钮 + window 钩子只为开发期 preview 验证, 不是玩家功能。
-import type { AsyncEngine } from './engine';
+import type { AsyncEngine, DnfManifest } from './engine';
 import { decodePng } from './png';
-import { buildStripCanvas } from './render-canvas';
-import { SpriteSet, type Cell } from './model';
+import { buildStripCanvas, renderCellCanvas } from './render-canvas';
+import { SpriteSet, type Cell, type RGBA } from './model';
 import { computeGeometry } from './geometry';
+import { coreSourceImg } from './dnf-rules';
+import { getBbox, footCenterX } from './pixels';
+import { openSubject, renderActionSegment, motionGeo, type OpenSubject } from './workflow';
+import { importActionGrid } from './import';
 import { runReskinLoop } from './reskin-demo';
 import { verifyWithOpfs, verifySubjectWithOpfs } from './verify-opfs';
 import type { WorkbenchHandle } from './workbench';
@@ -85,6 +89,114 @@ export function installDevHarness(getEngine: () => Promise<AsyncEngine>, wb: Wor
     const pet = await verifySubjectWithOpfs(eng, await fetchBytes('/pet.NPK'), 'sprite_pet_falcon.NPK');
     return { cls, mon, pet, allOk: cls.ok && mon.ok && pet.ok };
   };
+  // ── 序列帧对齐诊断 (dev-only): 量格斗家本体每帧真实 size/axis/内容bbox, 砸实"对齐"猜想 ──────────
+  // 真值用真·格斗家 (public/fighter.NPK, 紧裁包复现不出 → 必须用它)。decodePng 走浏览器 canvas。
+  w.__measureFighter = async () => {
+    const eng = await getEngine();
+    const res = await eng.unpack(await fetchBytes('/fighter.NPK'));
+    const man = res.manifest as DnfManifest;
+    const bodyImg = coreSourceImg(man);
+    const frames = man.frames.filter((f) => f.img_index === bodyImg && !f.linked)
+      .sort((a, b) => a.frame_index - b.frame_index);
+    const pngByFile = new Map(res.frames.map((f) => [f.name, f.png]));
+    const rows: Record<string, number | null>[] = [];
+    for (const mf of frames) {
+      const png = pngByFile.get(mf.file);
+      if (!png) continue;
+      const img = await decodePng(png);
+      const bb = getBbox(img as unknown as RGBA); // [x0,y0,x1,y1] exclusive; 全透明 null
+      rows.push({
+        fi: mf.frame_index, w: mf.pic_width, h: mf.pic_height, ax: mf.offset_x, ay: mf.offset_y,
+        bbT: bb ? bb[1] : null, bbB: bb ? bb[3] : null, bbL: bb ? bb[0] : null, bbR: bb ? bb[2] : null,
+        cW: bb ? bb[2] - bb[0] : 0, cH: bb ? bb[3] - bb[1] : 0,
+        footMinusAxisY: bb ? bb[3] - mf.offset_y : null,           // 内容底 - axis_y (axis_y 在不在脚底?)
+        cxMinusAxisX: bb ? Math.round((bb[0] + bb[2]) / 2 - mf.offset_x) : null, // 内容水平中心 - axis_x
+      });
+    }
+    const stat = (key: string): { min: number; med: number; max: number; range: number } => {
+      const xs = rows.map((r) => r[key]).filter((v): v is number => v != null).sort((a, b) => a - b);
+      return { min: xs[0]!, med: xs[xs.length >> 1]!, max: xs[xs.length - 1]!, range: xs[xs.length - 1]! - xs[0]! };
+    };
+    const summary = { bodyImg, n: rows.length, cH: stat('cH'), footMinusAxisY: stat('footMinusAxisY'), cxMinusAxisX: stat('cxMinusAxisX') };
+    (window as unknown as Record<string, unknown>).__FIGHTER_MEASURE = { summary, rows };
+    return summary;
+  };
+
+  // ── 对齐验证 (dev-only): 用真·重绘图跑真 import, 量化"成品逐帧 placed-by-axis 的稳定性" + 画轴对齐横图 ──
+  // segIdx 0-based; redrawUrl=public 下的重绘图 (如 /redraw5.jpg)。结果写 window.__TEST_IMPORT (eval 超时则轮询)。
+  let fighterOpen: OpenSubject | null = null;
+  const decodeUrlToRGBA = async (url: string): Promise<RGBA> => {
+    const bmp = await createImageBitmap(await (await fetch(url)).blob());
+    const MAX = 1024, sc = Math.min(1, MAX / Math.max(bmp.width, bmp.height));
+    const cw = Math.max(1, Math.round(bmp.width * sc)), ch = Math.max(1, Math.round(bmp.height * sc));
+    const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+    const ctx = c.getContext('2d')!; ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, 0, cw, ch); bmp.close();
+    const id = ctx.getImageData(0, 0, cw, ch);
+    return { data: id.data, width: cw, height: ch };
+  };
+  const rng = (xs: number[]): { min: number; max: number; range: number } => {
+    const s = xs.slice().sort((a, b) => a - b);
+    return { min: s[0]!, max: s[s.length - 1]!, range: s[s.length - 1]! - s[0]! };
+  };
+  w.__testImport = async (segIdx: number, redrawUrl: string, scaleMult = 1) => {
+    const eng = await getEngine();
+    if (!fighterOpen) fighterOpen = await openSubject(eng, await fetchBytes('/fighter.NPK'), 'sprite_character_fighter_equipment_avatar_skin.NPK');
+    const open = fighterOpen;
+    const r = await renderActionSegment(eng, open, 0, segIdx, '#00ff00');
+    const ai = await decodeUrlToRGBA(redrawUrl);
+    const rep = importActionGrid(ai, r.meta, { algo: 'floodkey', despill: true, scaleMult });
+    // 成品逐帧: placed-by-axis 后内容的 脚底中心x/脚底y(相对 axis) → 走位 = 这些量的 range (应 ≈ 原版); 高 = 本体大小(应稳)。
+    const repSS = new SpriteSet();
+    const iH: number[] = [], iFoot: number[] = [], iFootX: number[] = [];
+    for (const [g, i] of r.cells) {
+      const fr = rep.get(`${g},${i}`);
+      if (!fr) continue;
+      repSS.set({ group: g, image: i, size: [fr.img.width, fr.img.height], axis: fr.axis, img: new ImageData(new Uint8ClampedArray(fr.img.data), fr.img.width, fr.img.height) });
+      const fx = footCenterX(fr.img as RGBA, [0, 0, fr.img.width, fr.img.height]);
+      iH.push(fr.img.height); iFoot.push(fr.img.height - fr.axis[1]); iFootX.push(Math.round(fx - fr.axis[0]));
+    }
+    // 原版同段对照 (脚底相对 axis 的 横向/纵向 — 这才是动画"该有的"走位)
+    const oH: number[] = [], oFoot: number[] = [], oFootX: number[] = [];
+    for (const [g, i] of r.cells) {
+      const fr = r.ss.get(g, i); if (!fr?.img) continue;
+      const bb = getBbox(fr.img as unknown as RGBA); if (!bb) continue;
+      oH.push(bb[3] - bb[1]); oFoot.push(bb[3] - fr.axis[1]); oFootX.push(Math.round(footCenterX(fr.img as unknown as RGBA, bb) - fr.axis[0]));
+    }
+    // 画两条【入游戏运动】filmstrip 到 #out: 每帧按 axis 钉锚点 (motionGeo+renderCellCanvas) → 角色逐帧位移如实呈现。
+    // 上=原版(运动该有的样子) 下=成品。两条运动一致(只换皮) = 对齐对; 成品被钉死不动 = 对齐错。
+    const out = document.getElementById('out')!;
+    out.innerHTML = `<p class="stat">seg${segIdx + 1} · 导入 ${repSS.size}/${r.cells.length} 帧 · 入游戏运动 filmstrip: 上=原版 下=成品 (运动应一致)</p>`;
+    const drawStrip = (ss: SpriteSet, label: string): void => {
+      const mg = motionGeo(ss, r.cells);
+      const present = r.cells.filter(([g, i]) => ss.get(g, i)?.img);
+      const strip = document.createElement('canvas');
+      strip.width = Math.max(1, present.length * mg.cellW); strip.height = mg.cellH;
+      const x = strip.getContext('2d')!; x.fillStyle = '#8a8d93'; x.fillRect(0, 0, strip.width, strip.height);
+      present.forEach(([g, i], k) => { const fr = ss.get(g, i)!; x.drawImage(renderCellCanvas(fr.img as ImageData, fr.axis, mg), k * mg.cellW, 0); });
+      strip.style.cssText = 'border:1px solid #888;max-width:100%;image-rendering:pixelated;display:block;margin:4px 0';
+      const lab = document.createElement('p'); lab.className = 'stat'; lab.textContent = `${label} · ${present.length}帧 · 格${mg.cellW}×${mg.cellH}`;
+      out.appendChild(lab); out.appendChild(strip);
+    };
+    drawStrip(r.ss, '原版(入游戏运动)'); drawStrip(repSS, '成品(入游戏运动)');
+    const summary = {
+      seg: segIdx + 1, imported: repSS.size, total: r.cells.length, scaleMult,
+      原版: { 高: rng(oH), 脚纵向相对轴: rng(oFoot), 脚横向相对轴: rng(oFootX) },
+      成品: { 高: rng(iH), 脚纵向相对轴: rng(iFoot), 脚横向相对轴: rng(iFootX) },
+    };
+    (window as unknown as Record<string, unknown>).__TEST_IMPORT = summary;
+    return summary;
+  };
+
+  // OPFS 写【只格斗家】当目录, 驱动真 UI (用真·格斗家走完整 导出→导入→打包 链路验证对齐)。
+  w.__wbFighter = async () => {
+    const root = await (navigator as unknown as { storage: { getDirectory(): Promise<FsaDirHandle> } }).storage.getDirectory();
+    const fh = await root.getFileHandle('sprite_character_fighter_equipment_avatar_skin.NPK', { create: true });
+    const wr = await fh.createWritable(); await wr.write(await fetchBytes('/fighter.NPK') as unknown as BufferSource); await wr.close();
+    await wb.openWithDir(root);
+    return 'ok';
+  };
+
   // OPFS 写三类样本当目录, 驱动工作台 UI (验类型切换/对象列表/导出/打包, 免 picker 弹窗)。
   w.__wbDemoOpfs = async () => {
     const root = await (navigator as unknown as { storage: { getDirectory(): Promise<FsaDirHandle> } }).storage.getDirectory();

@@ -4,8 +4,14 @@
 // (与 PIL LANCZOS 不逐字节, 靠 preview 真浏览器验对齐) → 做成依赖注入, node 可注 nearest 测串接。
 import type { RGBA, XY } from './model';
 import { keyOut, floodKey, floodBg, despillGreen, defringeGreen } from './matte';
-import { getBbox, crop, columnAlphaProfile, rowAlphaProfile } from './pixels';
+import { getBbox, crop, columnAlphaProfile, rowAlphaProfile, footCenterX } from './pixels';
 import { splitBounds } from './align';
+
+/** 中位数 (升序取上中位, 与 workflow.mid 同口径)。全局本体缩放估计抗个别披风帧用。 */
+function median(xs: number[]): number {
+  const s = xs.slice().sort((a, b) => a - b);
+  return s.length ? s[s.length >> 1]! : 1;
+}
 
 /** 一格的导入契约: 哪帧 (g,i) + 导出时该格渲染后内容框 bbox (放大 cell 坐标系)。
  *  cellXy/cellWh 是导出布局位置, 导入不用(投影法重检测), 仅调试/参考。 */
@@ -15,6 +21,12 @@ export interface ImportCell {
   bbox: [number, number, number, number];
   cellXy?: [number, number];
   cellWh?: [number, number];
+  /** 原版该帧的 axis (offset_x/offset_y, 原生 px)。健壮对齐用它保留原版逐帧动画(走位/起跳)。 */
+  srcAxis?: [number, number];
+  /** 原版该帧的【内容 bbox】[x0,y0,x1,y1] (原生 px, 剔透明边)。脚底(y=oB)+脚底中心定锚, 沿用 srcAxis 口径。 */
+  srcBbox?: [number, number, number, number];
+  /** 原版该帧的【脚底中心 x】(原生 px)。横向锚点 = 它 (抗披风, 见 footCenterX); 缺省回退内容框中心。 */
+  srcFootX?: number;
 }
 
 /** 导出/导入契约 (buildActionGridCanvas 产出 → importActionGrid 消费)。对应 render.build_action_grid 的 meta。 */
@@ -86,7 +98,7 @@ const canvasResize: ResizeFn = (img, w, h) => {
  */
 export function importActionGrid(
   img: RGBA, meta: ImportMeta,
-  opts: { bgKey?: readonly [number, number, number]; keyTol?: number; resize?: ResizeFn; despill?: boolean; algo?: 'floodkey' | 'floodbg' } = {},
+  opts: { bgKey?: readonly [number, number, number]; keyTol?: number; resize?: ResizeFn; despill?: boolean; algo?: 'floodkey' | 'floodbg'; scaleMult?: number } = {},
 ): Map<string, ImportedFrame> {
   const resize = opts.resize ?? canvasResize;
   const keyTol = opts.keyTol ?? 34;
@@ -113,8 +125,13 @@ export function importActionGrid(
   const colB = splitBounds(columnAlphaProfile(det), meta.cols, IW) ?? equalBounds(meta.cols, IW);
   const rowB = splitBounds(rowAlphaProfile(det), meta.rows, IH) ?? equalBounds(meta.rows, IH);
 
-  const k = (meta.upscale || 1) * (meta.scale || 1);
+  const kFallback = (meta.upscale || 1) * (meta.scale || 1);
   const out = new Map<string, ImportedFrame>();
+
+  // 第一遍: 逐格 切格→去背→内容 bbox; 同时收集 (原版内容高/新内容高) 比值 → 算全局本体缩放基准。
+  interface Det { cell: ImportCell; sprite0: RGBA; nw: number; nh: number; }
+  const dets: Det[] = [];
+  const ratios: number[] = []; // oH/nh = AI像素→原生像素 (= 本体若与原版等高的缩放); 取中位抗个别披风帧
   meta.cells.forEach((cell, idx) => {
     const gr = Math.floor(idx / meta.cols), gc = idx % meta.cols;
     const x0 = colB[gc]!, y0 = rowB[gr]!, x1 = colB[gc + 1]!, y1 = rowB[gr + 1]!;
@@ -124,16 +141,40 @@ export function importActionGrid(
     if (!nb) return;                                       // 空格 (该帧 AI 没画) 跳过
     const sprite0 = crop(sub, nb);
     const nw = sprite0.width, nh = sprite0.height;
-    // 健壮对齐 (与原版逐帧高度/头身比脱钩): 新内容统一缩到角色基准高 targetH(保宽高比), 轴=内容底部中心。
-    // 旧做法把新图塞进原版每帧内容框(缩到原帧高+按原帧中心摆+原帧 basePt)→ 原版逐帧在动 + 异比例角色 → 左右闪/变形。
-    // 现在每帧同高、脚底中心钉同一锚 → 补丁角色原地动、不闪、企鹅/任何头身比都成立。缺 targetH(旧 meta)回退原帧内容高。
-    const targetH = meta.targetH && meta.targetH > 0 ? meta.targetH : Math.max(1, (cell.bbox[3] - cell.bbox[1]) / k);
-    const s = targetH / nh;
-    const ow = Math.max(1, Math.round(nw * s)), oh = Math.max(1, Math.round(nh * s));
-    const sprite = resize(sprite0, ow, oh);
-    // 轴 = 内容底部中心 + 角色"家锚"(baseDX/baseDY): baseDY 落到原版脚底(不飘), baseDX 钉一致中心(不左右抖); 缺省回退纯底部中心。
-    const axis: XY = [Math.round(ow / 2 + (meta.baseDX ?? 0)), Math.round(oh + (meta.baseDY ?? 0))];
-    out.set(`${cell.g},${cell.i}`, { group: cell.g, image: cell.i, img: sprite, axis });
+    dets.push({ cell, sprite0, nw, nh });
+    if (cell.srcBbox) ratios.push((cell.srcBbox[3] - cell.srcBbox[1]) / Math.max(1, nh));
   });
+
+  // 全局本体缩放 (核心思路): 本体是【固定比例的整体】, 不该随动作/装饰逐帧缩放 —— 披风等装饰把内容框撑大撑小,
+  // 旧的"每帧缩到原版内容高"会让本体跟着脉动。故改用【一个全局缩放】: 基准 = 中位(原版内容高/新内容高)
+  // (抗个别披风帧 + 自适应 AI 出图分辨率), 再 × 用户【本体缩放】倍数 (滑杆手调, 因为装饰让自动测不准、但人一眼能比对)。
+  // 全段同一缩放 → 本体大小恒定; 引擎只剩 XY 锚定要算 (见下)。
+  const sBase = ratios.length ? median(ratios) : 1;
+  const s = sBase * (opts.scaleMult ?? 1);
+
+  // 第二遍: 全局缩放 + 逐帧【脚底锚定】(沿用原版 axis) → 走位/起跳逐帧运动保住, 本体比例固定。
+  for (const { cell, sprite0, nw, nh } of dets) {
+    let sprite: RGBA, axis: XY;
+    if (cell.srcBbox && cell.srcAxis) {
+      const [oL, oT, oR, oB] = cell.srcBbox;
+      const [ax, ay] = cell.srcAxis;
+      const ow = Math.max(1, Math.round(nw * s)), oh = Math.max(1, Math.round(nh * s));
+      sprite = resize(sprite0, ow, oh);
+      // 横向: 新内容【脚底中心】对齐原版脚底中心 (轴相对 origFootX-ax, 抗披风); 纵向: 新内容底对齐原版内容底 (oB-ay)。
+      // 脚底中心在【缩放后的 sprite】上量(= 实际入游戏的脚位, 不靠缩放前估算)。轴沿用原版口径(远离精灵本体也照搬)
+      // → 原版每帧走位/起跳/前冲全保住; 缩放是全局常数 → 本体不随动作变大小。
+      const origFootX = cell.srcFootX ?? (oL + oR) / 2;
+      const fx = footCenterX(sprite, [0, 0, ow, oh]);
+      axis = [Math.round(fx - (origFootX - ax)), Math.round(oh - (oB - ay))];
+    } else {
+      // 回退 (旧 meta 无 srcBbox/srcAxis): 归一到 targetH + 内容底中心轴 (会抹平动画, 仅兼容旧契约/测试)。
+      const targetH = meta.targetH && meta.targetH > 0 ? meta.targetH : Math.max(1, (cell.bbox[3] - cell.bbox[1]) / kFallback);
+      const sf = targetH / nh;
+      const ow = Math.max(1, Math.round(nw * sf)), oh = Math.max(1, Math.round(nh * sf));
+      sprite = resize(sprite0, ow, oh);
+      axis = [Math.round(ow / 2 + (meta.baseDX ?? 0)), Math.round(oh + (meta.baseDY ?? 0))];
+    }
+    out.set(`${cell.g},${cell.i}`, { group: cell.g, image: cell.i, img: sprite, axis });
+  }
   return out;
 }

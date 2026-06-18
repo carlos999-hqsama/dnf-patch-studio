@@ -5,12 +5,12 @@
 // 全走 workflow.openSubject 统一编排 (职业=单本体动作, 怪物/宠物=多独立动作)。数据流在 workflow(无 DOM),
 // 这里只管 DOM / 事件 / 动画预览 / 进度条。真实目录走 showDirectoryPicker(需用户手势, 限 Chrome 系)。
 import type { AsyncEngine, HideImg } from './engine';
-import { renderCellGrounded } from './render-canvas';
+import { renderCellGrounded, renderCellCanvas } from './render-canvas';
 import type { ImportMeta } from './import';
 import { SpriteSet, type Cell, type RGBA } from './model';
 import type { Geometry } from './geometry';
 import {
-  openSubject, setGrid, renderActionSegment, importActionSegment, deploySubject, groundedGeo,
+  openSubject, setGrid, renderActionSegment, importActionSegment, deploySubject, groundedGeo, motionGeo,
   listSkins, listHideSources, filterSubjects, type OpenSubject, type SubjectEntry, type GridSpec,
 } from './workflow';
 import { parseSkin, hidePatchName, type SubjectType } from './dnf-rules';
@@ -56,13 +56,15 @@ function toImageData(img: RGBA): ImageData {
 // 后台/隐藏标签页 rAF 会被浏览器暂停 → await 永久挂起 → 整个流程卡死 (preview 隐藏标签页实测中招)。
 const raf = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
-/** 在 canvas 上循环播放一组帧 (轴锚定: 每帧 axis 钉同锚 + 统一 scale → 角色按游戏注册点原地动、与导出图一致)
- *  = 循环预览。返回 setInterval id, 调用方负责 clearInterval (切组/重渲时停)。DNF 帧时序在 .ani(不读) → 固定节拍。
- *  canvas 内部分辨率 = geo cell; 显示尺寸交给 CSS (.preview aspect-ratio:1 方框 + canvas object-fit:contain
- *  按比例 letterbox 填入), 不在 JS 设 inline 宽高 — 否则会被 .preview 的 max 约束各自裁剪致角色变形。 */
-function animateStrip(canvas: HTMLCanvasElement, ss: SpriteSet, cells: Cell[], geo: Geometry, bg: string): number {
-  canvas.width = geo.cellW;
-  canvas.height = geo.cellH;
+/** 在 canvas 上循环播放一组帧 = 入游戏运动预览。每帧按【原版 axis】钉锚点 (renderCellCanvas + motionGeo) →
+ *  走位/起跳/前冲等逐帧位移如实呈现 (这是判断"补丁会不会动对"的关键; 旧版用 grounded 把每帧居中接地、
+ *  把运动抹平了, 看不出对齐对错)。geo 仅用于兜底, 实际几何用 motionGeo 现算 (按轴注册框紧内容并集)。
+ *  返回 setInterval id, 调用方负责 clearInterval (切组/重渲时停)。DNF 帧时序在 .ani(不读) → 固定节拍。
+ *  canvas 内部分辨率 = motionGeo cell; 显示尺寸交给 CSS (.preview aspect-ratio:1 方框 + object-fit:contain)。 */
+function animateStrip(canvas: HTMLCanvasElement, ss: SpriteSet, cells: Cell[], _geo: Geometry, bg: string): number {
+  const mg = motionGeo(ss, cells); // 按轴注册框紧 → 角色大 + 保留逐帧运动
+  canvas.width = mg.cellW;
+  canvas.height = mg.cellH;
   const ctx = canvas.getContext('2d')!;
   const present = cells.filter(([g, i]) => ss.get(g, i)?.img);
   let idx = 0;
@@ -72,7 +74,7 @@ function animateStrip(canvas: HTMLCanvasElement, ss: SpriteSet, cells: Cell[], g
     if (!present.length) return;
     const cell = present[idx % present.length]!;
     const fr = ss.get(cell[0], cell[1])!;
-    ctx.drawImage(renderCellGrounded(fr.img as ImageData, fr.axis, geo), 0, 0);
+    ctx.drawImage(renderCellCanvas(fr.img as ImageData, fr.axis, mg), 0, 0); // 轴钉锚点 → 入游戏运动
     idx++;
   };
   tick();
@@ -200,8 +202,22 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
     for (const [g, i] of cur.cells) open.replaced.delete(`${g},${i}`); // 先清这组旧帧再重抠
     const raw = rawAiByKey.get(key);
     if (!raw) { importedKeys.delete(key); return; }
-    const n = importActionSegment(open, raw, cur.meta, { algo, despill });
+    const n = importActionSegment(open, raw, cur.meta, { algo, despill, scaleMult: open.bodyScaleMult });
     if (n > 0) importedKeys.add(key); else importedKeys.delete(key);
+  }
+
+  // 改【本体缩放】后, 把所有已上传重绘图的组按新缩放全部重对齐 (本体缩放是全局的, 不能只改当前组)。
+  // 像素已缓存(imgDataByCell) → renderActionSegment 很快; 只重跑对齐, 不重解包。
+  async function reimportAll(): Promise<void> {
+    if (!open) return;
+    const o = open, eng = await getEngine();
+    for (const [key, raw] of rawAiByKey) {
+      const [aStr, sStr] = key.split(':');
+      const r = await renderActionSegment(eng, o, +aStr!, +sStr!, EXPORT_BG);
+      for (const [g, i] of r.cells) o.replaced.delete(`${g},${i}`);
+      const n = importActionSegment(o, raw, r.meta, { algo, despill, scaleMult: o.bodyScaleMult });
+      if (n > 0) importedKeys.add(key); else importedKeys.delete(key);
+    }
   }
 
   // 切「16格放空」重分组后, 按已换帧(open.replaced)重建各组"已重绘✓"标记 (分组变了, 换过的帧还在)。
@@ -462,6 +478,7 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
       side.appendChild(swatchRow(() => rightBg, (b) => { rightBg = b; }));
 
       side.appendChild(buildAlgo());
+      side.appendChild(buildScale());
 
       if (subjType === 'class') {                       // 隐藏时装仅职业有意义 (怪物/宠物无装备槽)
         const hide = el('button', 'btn block', '隐藏装备·露出本体');
@@ -476,6 +493,26 @@ export function mountWorkbench(getEngine: () => Promise<AsyncEngine>, els: Workb
     }
     panel.appendChild(main);
     return panel;
+  }
+
+  // 本体缩放滑杆: 本体是固定比例的整体, 缩放是【一个全局值】(不随动作变)。默认=自动基准(×1.00), 用户对着
+  // 左栏原版/右栏成品两个循环预览, 拖到本体一样大。改完按新缩放重对齐【所有】已上传组 (reimportAll)。
+  function buildScale(): HTMLElement {
+    const o = open!;
+    const box = el('div', 'algo');
+    box.appendChild(el('span', 'lbl', '本体缩放 (对着左右预览拖到一样大)'));
+    const row = el('div', 'bg-row');
+    const rng = el('input', 'sel'); rng.type = 'range'; rng.min = '0.5'; rng.max = '1.5'; rng.step = '0.01';
+    rng.value = String(o.bodyScaleMult); rng.style.flex = '1';
+    const val = el('span', 'lbl', `×${o.bodyScaleMult.toFixed(2)}`); val.style.minWidth = '46px';
+    rng.addEventListener('input', () => { val.textContent = `×${(+rng.value).toFixed(2)}`; }); // 拖动时只更新数值(不重渲, 免闪)
+    rng.addEventListener('change', () => {                                                       // 松手才重对齐+重渲
+      o.bodyScaleMult = +rng.value;
+      void (async () => { pgShow(headPg, '按新缩放重对齐…'); await raf(); await reimportAll(); pgHide(headPg); await renderBoth(); })();
+    });
+    row.append(rng, val);
+    box.appendChild(row);
+    return box;
   }
 
   function buildAlgo(): HTMLElement {

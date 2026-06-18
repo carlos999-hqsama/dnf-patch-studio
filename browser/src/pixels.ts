@@ -20,6 +20,21 @@ export function getBbox(img: RGBA): [number, number, number, number] | null {
   return found ? [x0, y0, x1 + 1, y1 + 1] : null;
 }
 
+/** 内容【脚底带】(底部 bandFrac 高度) 的水平中心 x — 抗装饰的横向锚点。
+ *  披风/特效一般往上/往后甩, 脚底那一带是干净的本体腿脚 → 取底带非透明像素 x 范围中点, 比"整框中心"
+ *  (会被披风横向拉偏) 稳得多。box=[x0,y0,x1,y1] 内容 bbox; 底带无内容则回退整框中心。 */
+export function footCenterX(img: RGBA, box: [number, number, number, number], bandFrac = 0.18): number {
+  const [x0, y0, x1, y1] = box;
+  const band = Math.max(1, Math.round((y1 - y0) * bandFrac));
+  let xmin = Infinity, xmax = -Infinity;
+  for (let y = Math.max(y0, y1 - band); y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      if (img.data[(y * img.width + x) * 4 + 3]!) { if (x < xmin) xmin = x; if (x > xmax) xmax = x; }
+    }
+  }
+  return Number.isFinite(xmin) ? (xmin + xmax) / 2 : (x0 + x1) / 2;
+}
+
 /** 裁子矩形 (复制), box=[x0,y0,x1,y1] exclusive。对应 PIL crop。 */
 export function crop(img: RGBA, box: [number, number, number, number]): RGBA {
   const [x0, y0, x1, y1] = box;

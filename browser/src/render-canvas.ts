@@ -3,7 +3,7 @@
 import type { Cell, SpriteSet } from './model';
 import { type Geometry } from './geometry';
 import { computeGridLayout } from './layout';
-import { getBbox } from './pixels';
+import { getBbox, footCenterX } from './pixels';
 import type { ImportMeta, ImportCell } from './import';
 
 /** 一帧 → cellW×cellH canvas: 帧的轴(脚底)钉到 geo.anchor。scale≠1 时 drawImage 缩放。
@@ -110,7 +110,15 @@ export function buildActionGridCanvas(
     const bd = bctx.getImageData(0, 0, layout.cw, layout.ch);
     const bb = getBbox({ data: bd.data, width: layout.cw, height: layout.ch });
     // bbox = 该格渲染后内容框 (放大 cell 坐标); 仅作导入 targetH 缺省时的回退参考 (默认走 meta.targetH)。
-    metaCells.push({ g, i, bbox: bb ?? [0, 0, 1, 1], cellXy: slot.cellXy, cellWh: slot.cellWh });
+    // srcAxis/srcBbox/srcFootX = 原版该帧的 axis + 内容 bbox + 脚底中心 (原生 px) → 导入端健壮对齐用它保留
+    // 原版逐帧运动(走位/起跳); 脚底中心当横向锚点(抗披风)。
+    const srcImg = { data: (fr.img as ImageData).data, width: fr.img!.width, height: fr.img!.height };
+    const srcBb = getBbox(srcImg);
+    metaCells.push({
+      g, i, bbox: bb ?? [0, 0, 1, 1], cellXy: slot.cellXy, cellWh: slot.cellWh,
+      srcAxis: [fr.axis[0], fr.axis[1]], srcBbox: srcBb ?? undefined,
+      srcFootX: srcBb ? footCenterX(srcImg, srcBb) : undefined,
+    });
   });
   const meta: ImportMeta = {
     n: present.length, cols: layout.cols, rows: layout.rows,

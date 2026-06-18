@@ -129,6 +129,7 @@ export interface OpenSubject {
   loadedImgs: Set<number>;               // 已解像素的 IMG (懒解去重)
   replaced: Map<string, ImportedFrame>;  // "g,i" → 替换帧 (跨动作累积; g=img_index 故不撞)
   gridCols: number; gridRows: number;    // 当前导出网格(3 或 4); 渲染导出图 + 显示网格列数用, setGrid 切换时更新
+  bodyScaleMult: number;                 // 用户【本体缩放】倍数 (整个角色统一, 默认 1)。导入时 × 自动基准 → 全局缩放 (见 import)
 }
 
 /** 从 manifest 收一个 IMG 的 size/axis + cells + file 映射 (不解像素, 写进传入的 ss/fileByCell)。 */
@@ -177,7 +178,7 @@ export async function openSubject(eng: AsyncEngine, srcNpk: Uint8Array, fileName
   return {
     type, fileName, zh: subjectZh(fileName, type), srcNpk, manifest, actions,
     metaSS, fileByCell, pngByFile: new Map(), imgDataByCell: new Map(), loadedImgs: new Set(), replaced: new Map(),
-    gridCols: grid.cols, gridRows: grid.rows,
+    gridCols: grid.cols, gridRows: grid.rows, bodyScaleMult: 1,
   };
 }
 
@@ -272,6 +273,26 @@ export function groundedGeo(ss: SpriteSet, cells: Cell[]): Geometry {
   return { cellW, cellH, anchor: [-L + MARGIN, cellH - MARGIN], scale: 1 }; // anchor=[axis_x落点, 底基线]
 }
 
+/** 运动预览几何 (循环播放用): 按【轴注册】把所有帧的内容并集框紧 → 显示帧时角色按原版 axis 摆放,
+ *  走位/起跳/前冲等逐帧运动【如实呈现】(对照 groundedGeo 把每帧居中接地、抹平运动只看单帧)。
+ *  与 computeGeometry 区别: 后者按"帧尺寸相对轴的最大外延"算格 → 轴远离精灵时格子大半空白、角色缩成一小团;
+ *  这里按【内容 bbox 相对轴】并集 → 紧框住运动范围, 角色大、又保留帧间位移。配 renderCellCanvas (轴钉锚点) 用。 */
+export function motionGeo(ss: SpriteSet, cells: Cell[]): Geometry {
+  let UL = Infinity, UT = Infinity, UR = -Infinity, UB = -Infinity;
+  for (const [g, i] of cells) {
+    const fr = ss.get(g, i);
+    if (!fr?.img) continue;
+    const bb = getBbox(fr.img as RGBA); // 内容 bbox [x0,y0,x1,y1]; 全透明 null
+    if (!bb) continue;
+    const [ax, ay] = fr.axis;
+    UL = Math.min(UL, bb[0] - ax); UT = Math.min(UT, bb[1] - ay); // 内容相对轴
+    UR = Math.max(UR, bb[2] - ax); UB = Math.max(UB, bb[3] - ay);
+  }
+  if (!Number.isFinite(UL)) return { cellW: 1, cellH: 1, anchor: [0, 0], scale: 1 };
+  const cellW = Math.max(1, Math.round(UR - UL) + 2 * MARGIN), cellH = Math.max(1, Math.round(UB - UT) + 2 * MARGIN);
+  return { cellW, cellH, anchor: [Math.round(-UL) + MARGIN, Math.round(-UT) + MARGIN], scale: 1 }; // anchor = axis 落点
+}
+
 /** 渲染某动作的某组 → 导出网格 canvas + meta (注入该动作的 targetH/家锚)。懒解该组像素 + 现算本组几何。 */
 export async function renderActionSegment(
   eng: AsyncEngine, open: OpenSubject, actionIndex: number, segIndex: number, bg?: string,
@@ -292,7 +313,7 @@ export async function renderActionSegment(
 /** 导入某组 AI 图 → 去背对齐 → 累积进 open.replaced (键 "img,frame" 跨动作不撞)。返回导入帧数。 */
 export function importActionSegment(
   open: OpenSubject, aiImg: { data: Uint8ClampedArray; width: number; height: number }, meta: ImportMeta,
-  opts: { bgKey?: readonly [number, number, number]; algo?: 'floodkey' | 'floodbg'; despill?: boolean } = {},
+  opts: { bgKey?: readonly [number, number, number]; algo?: 'floodkey' | 'floodbg'; despill?: boolean; scaleMult?: number } = {},
 ): number {
   const rep = importActionGrid(aiImg, meta, opts);
   for (const [k, v] of rep) open.replaced.set(k, v);

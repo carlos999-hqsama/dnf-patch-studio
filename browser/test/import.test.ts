@@ -89,6 +89,45 @@ describe('importActionGrid (网格图 → 替换帧)', () => {
     expect(f.axis).toEqual([102, 208]);
   });
 
+  it('健壮对齐 (全局缩放 + 脚底锚定): 本体一个全局缩放(不随动作/披风变), 逐帧脚底锚定保留原版走位 + 沿用原版 axis', () => {
+    // 3 格各异: 格0 红 4×8; 格1 蓝 6×4; 格2 品红 6×10(=带披风的高内容)。验证: ①本体缩放全局一致(s 同) ②披风帧不被压扁
+    // (旧逻辑会缩到原版内容高 → 本体随披风脉动) ③脚底中心+脚底纵向锚定保留原版几何 + 轴沿用原版。
+    const img = greenGrid(36, 16);
+    fillRect(img, 4, 2, 8, 10, [255, 0, 0, 255]);    // 格0: nw=4 nh=8 @x[4,8)
+    fillRect(img, 15, 8, 21, 12, [0, 0, 255, 255]);  // 格1: nw=6 nh=4 @x[15,21)
+    fillRect(img, 26, 4, 32, 14, [255, 0, 255, 255]);// 格2: nw=6 nh=10 @x[26,32) (高=披风)
+    const meta: ImportMeta = {
+      n: 3, cols: 3, rows: 1, W: 36, H: 16, upscale: 1, scale: 1,
+      cells: [
+        { g: 0, i: 0, bbox: [0, 0, 1, 1], srcBbox: [10, 20, 50, 100], srcAxis: [200, 300], srcFootX: 30 }, // oH=80
+        { g: 0, i: 1, bbox: [0, 0, 1, 1], srcBbox: [0, 0, 30, 40], srcAxis: [60, 90], srcFootX: 15 },       // oH=40
+        { g: 0, i: 2, bbox: [0, 0, 1, 1], srcBbox: [0, 0, 30, 40], srcAxis: [60, 90], srcFootX: 15 },       // oH=40(同骨架, 但新内容带披风)
+      ],
+    };
+    const out = importActionGrid(img, meta, { resize: nearest });
+    const f0 = out.get('0,0')!, f1 = out.get('0,1')!, f2 = out.get('0,2')!;
+    // 全局缩放 s=median(oH/nh)=median(80/8,40/4,40/10)=median(10,10,4)=10 (披风帧 4 被中位剔掉, 不拖累)。
+    // 格0: 40×80; 格1: 60×40; 格2(披风高): 60×100 ← 关键: oh=nh*s=100, 没被压回原版内容高 40 (本体不随披风缩)。
+    expect([f0.img.width, f0.img.height]).toEqual([40, 80]);
+    expect([f1.img.width, f1.img.height]).toEqual([60, 40]);
+    expect([f2.img.width, f2.img.height]).toEqual([60, 100]);
+    // 本体缩放全局一致: 三帧 ow/nw 都=10
+    expect([f0.img.width / 4, f1.img.width / 6, f2.img.width / 6]).toEqual([10, 10, 10]);
+    // 不变式: 成品【脚底相对轴】的 横向(脚底中心)/纵向(底) == 原版该帧 (走位保留 + 轴沿用原版)
+    const footX = (f: typeof f0): number => {
+      // 成品 sprite 已裁到内容, 底带中心
+      let xmin = Infinity, xmax = -Infinity; const h = f.img.height, w = f.img.width;
+      const band = Math.max(1, Math.round(h * 0.18));
+      for (let y = h - band; y < h; y++) for (let x = 0; x < w; x++) if (f.img.data[(y * w + x) * 4 + 3]!) { if (x < xmin) xmin = x; if (x > xmax) xmax = x; }
+      return (xmin + xmax) / 2;
+    };
+    for (const [f, c] of [[f0, meta.cells[0]!], [f1, meta.cells[1]!], [f2, meta.cells[2]!]] as const) {
+      const [, , , oB] = c.srcBbox!; const [ax, ay] = c.srcAxis!;
+      expect(Math.abs((footX(f) - f.axis[0]) - (c.srcFootX! - ax))).toBeLessThanOrEqual(1); // 脚底中心相对轴 == 原版 (走位横向, ±1px 舍入)
+      expect(f.img.height - f.axis[1]).toBe(oB - ay);                                       // 脚底纵向相对轴 == 原版 (走位纵向/接地, 精确)
+    }
+  });
+
   it('空格 (AI 没画该帧) → 跳过, 不产替换帧', () => {
     const img = greenGrid(24, 12);
     fillRect(img, 4, 2, 8, 10, [255, 0, 0, 255]); // 只画格0
