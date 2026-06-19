@@ -68,6 +68,9 @@ export interface ImportOpts {
   despill?: boolean;
   algo?: 'floodkey' | 'floodbg';
   scaleMult?: number;
+  /** 横向锚: 'foot'(默认,现状)=现场测缩放后脚底中心(抗披风,但对 AI 改脚底/残留敏感→个别帧飘);
+   *  'proportional'=用原版脚底在原内容里的比例 × 新内容宽(不现场测脚底极值→抗 AI 形变,同体型更稳)。 */
+  anchorMode?: 'foot' | 'proportional';
 }
 
 /** 一帧的【可编辑中间态】: 抠图+缩放后的纯精灵 + 预对齐轴 relAxis。
@@ -80,6 +83,20 @@ export interface EditFrame {
   sprite: RGBA;
   /** 预对齐轴 [x,y] (sprite 像素坐标系; = 旧脚底锚定算的 axis, 大部分帧到位)。编辑器逐帧拖动改它。 */
   relAxis: [number, number];
+}
+
+/** 比例锚式 relAxis (单帧, 纯几何, 不碰像素): 横向 = 原版脚底在原内容里的比例 × 新内容宽 − (原版脚底相对轴),
+ *  不现场测脚底极值 → 抗 AI 改脚底/残绿形变, 同体型更稳; 纵向 = 新内容底对齐原版内容底 (接地; DNF 轴常在体外,
+ *  按 axis_y 会让脚随姿势乱飘)。spriteW/spriteH = 已缩放精灵尺寸 (已裁到内容 bbox → 左边=0、底边=spriteH)。
+ *  cell 缺 srcBbox/srcAxis (旧 meta) → 回退底部中心。import 'proportional' 模式 与 编辑器「一键自动对齐」
+ *  (workflow.autoAlignRelAxis) 共用此几何 = 单一权威源, 改一处两处一致 (防"两版对齐各写一份"的老坑)。 */
+export function proportionalRelAxis(spriteW: number, spriteH: number, cell: ImportCell): [number, number] {
+  if (!cell.srcBbox || !cell.srcAxis) return [Math.round(spriteW / 2), spriteH];
+  const [oL, , oR, oB] = cell.srcBbox;
+  const [ax, ay] = cell.srcAxis;
+  const origFootX = cell.srcFootX ?? (oL + oR) / 2;
+  const p = oR > oL ? (origFootX - oL) / (oR - oL) : 0.5; // 脚底在原内容横向的比例 (0=左缘 1=右缘)
+  return [Math.round(p * spriteW - (origFootX - ax)), Math.round(spriteH - (oB - ay))];
 }
 
 function cloneRGBA(img: RGBA): RGBA {
@@ -131,6 +148,7 @@ export function importActionGridFrames(
   // 抠图算法 (matte): floodkey=四角中位全图色键(默认, 快, 撞色会吃角色); floodbg=四角连通域
   // (只吃连到角落的背景, 角色身上同色的孤岛保得住 → 撞色用它)。对应右栏"抠图算法"下拉。
   const algo = opts.algo ?? 'floodkey';
+  const anchorMode = opts.anchorMode ?? 'foot'; // 横向锚: foot(现场测脚底,抗披风) / proportional(比例锚,抗AI形变)
   const floodMatte = (im: RGBA): RGBA => (algo === 'floodbg' ? floodBg(im) : floodKey(im));
 
   // despill 削绿幕溢出: 只在【绿底】用 — 它会削任何 g>r&&g>b 的像素, 非绿底会误伤绿色角色
@@ -180,16 +198,21 @@ export function importActionGridFrames(
   for (const { cell, sprite0, nw, nh } of dets) {
     let sprite: RGBA, axis: XY;
     if (cell.srcBbox && cell.srcAxis) {
-      const [oL, oT, oR, oB] = cell.srcBbox;
-      const [ax, ay] = cell.srcAxis;
       const ow = Math.max(1, Math.round(nw * s)), oh = Math.max(1, Math.round(nh * s));
       sprite = resize(sprite0, ow, oh);
-      // 横向: 新内容【脚底中心】对齐原版脚底中心 (轴相对 origFootX-ax, 抗披风); 纵向: 新内容底对齐原版内容底 (oB-ay)。
-      // 脚底中心在【缩放后的 sprite】上量(= 实际入游戏的脚位, 不靠缩放前估算)。轴沿用原版口径(远离精灵本体也照搬)
-      // → 原版每帧走位/起跳/前冲全保住; 缩放是全局常数 → 本体不随动作变大小。
-      const origFootX = cell.srcFootX ?? (oL + oR) / 2;
-      const fx = footCenterX(sprite, [0, 0, ow, oh]);
-      axis = [Math.round(fx - (origFootX - ax)), Math.round(oh - (oB - ay))];
+      if (anchorMode === 'proportional') {
+        // 比例锚: 不现场测脚底, 用原版脚底比例 × 新内容宽 (抗 AI 改脚底/残绿形变)。与编辑器「一键自动对齐」同口径(单一权威)。
+        axis = proportionalRelAxis(ow, oh, cell);
+      } else {
+        // 脚底锚 (默认/现状): 新内容【脚底中心】对齐原版脚底中心 (轴相对 origFootX-ax, 抗披风); 纵向: 新内容底对齐原版内容底 (oB-ay)。
+        // 脚底中心在【缩放后的 sprite】上量(= 实际入游戏的脚位, 不靠缩放前估算)。轴沿用原版口径(远离精灵本体也照搬)
+        // → 原版每帧走位/起跳/前冲全保住; 缩放是全局常数 → 本体不随动作变大小。
+        const [oL, , oR, oB] = cell.srcBbox;
+        const [ax, ay] = cell.srcAxis;
+        const origFootX = cell.srcFootX ?? (oL + oR) / 2;
+        const fx = footCenterX(sprite, [0, 0, ow, oh]);
+        axis = [Math.round(fx - (origFootX - ax)), Math.round(oh - (oB - ay))];
+      }
     } else {
       // 回退 (旧 meta 无 srcBbox/srcAxis): 归一到 targetH + 内容底中心轴 (会抹平动画, 仅兼容旧契约/测试)。
       const targetH = meta.targetH && meta.targetH > 0 ? meta.targetH : Math.max(1, (cell.bbox[3] - cell.bbox[1]) / kFallback);

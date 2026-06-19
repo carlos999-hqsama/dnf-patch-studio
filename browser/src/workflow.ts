@@ -7,7 +7,7 @@
 import type { AsyncEngine, DnfManifest } from './engine';
 import { decodePng, encodePng } from './png';
 import { buildActionGridCanvas } from './render-canvas';
-import { importActionGrid, importActionGridFrames, type ImportMeta, type ImportedFrame, type EditFrame, type ImportOpts } from './import';
+import { importActionGrid, importActionGridFrames, proportionalRelAxis, type ImportMeta, type ImportCell, type ImportedFrame, type EditFrame, type ImportOpts } from './import';
 import { conformToDnf, getBbox } from './pixels';
 import { SpriteSet, type Cell, type Action, type RGBA } from './model';
 import { MARGIN, type Geometry } from './geometry';
@@ -369,6 +369,14 @@ export function autoGroupOffset(edit: SegmentEdit, meta: ImportMeta): [number, n
   }
   if (!oxs.length) return [0, 0];
   return [Math.round(mid(oxs) - mid(nxs)), Math.round(mid(oys) - mid(nys))];
+}
+
+/** 编辑器「✨一键自动对齐」用: 纯几何重算单帧 relAxis (不重抠图, 只挪轴)。横向比例锚(抗 AI 形变) + 纵向接地。
+ *  spriteW/spriteH = 该帧当前精灵尺寸 (edit.frames[].sprite, 已缩放裁内容); cell = meta.cells 里对应 (g,i) 的导入契约
+ *  (带 srcBbox/srcAxis/srcFootX)。委托 import.proportionalRelAxis = 与 import 'proportional' 模式同一权威源。
+ *  与 autoGroupOffset 成对: 先逐帧 autoAlignRelAxis 打底, 再 autoGroupOffset 整组锚原版 (两层独立)。 */
+export function autoAlignRelAxis(spriteW: number, spriteH: number, cell: ImportCell): [number, number] {
+  return proportionalRelAxis(spriteW, spriteH, cell);
 }
 
 /** 回封: 累积替换帧硬边化+编码 → 按类型展开 (class 铺骨架变体 / monster·pet 各动作独立) → repack → 补丁 NPK。 */

@@ -5,7 +5,7 @@
 import { SpriteSet, type Cell, type RGBA } from './model';
 import type { Geometry } from './geometry';
 import type { ImportMeta, EditFrame } from './import';
-import { type SegmentEdit, autoGroupOffset, motionGeo } from './workflow';
+import { type SegmentEdit, autoGroupOffset, autoAlignRelAxis, motionGeo } from './workflow';
 import { getBbox, footCenterX } from './pixels';
 import { renderCellCanvas, drawGhost } from './render-canvas';
 
@@ -75,6 +75,10 @@ function ensureStyle(): void {
 .ae-modebtns .btn.on{border-color:var(--blue);color:var(--blue);background:#f0f7ff}
 .ae-hint{font-size:11.5px;color:var(--ink3);line-height:1.55;margin:0}
 .ae-hint b{color:var(--ink);font-weight:600}
+.ae-auto{border-color:var(--blue);background:#f0f7ff}
+.ae-pad{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;max-width:178px;margin:0 auto}
+.ae-pad .btn{padding:6px 0}
+.ae-padc{display:flex;align-items:center;justify-content:center;font-size:10.5px;color:var(--ink3)}
 .ae-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .ae-empty{flex:1;display:flex;align-items:center;justify-content:center;color:var(--ink3);font-size:14px}
 `;
@@ -260,6 +264,13 @@ export function openAlignEditor(opts: AlignEditorOpts): Promise<SegmentEdit | nu
 
     const frameLbl = el('p', 'ae-hint', `第 ${curIdx + 1} / ${frames.length} 帧`);
 
+    // ── ✨一键自动对齐 (最醒目, 放右栏最前): 自动打底, 不行再逐帧手工 ────────────────────────────────
+    const autoBox = el('div', 'algo ae-auto');
+    const autoAllBtn = el('button', 'btn primary block', '✨ 一键自动对齐');
+    autoAllBtn.addEventListener('click', autoAlignAll);
+    autoBox.appendChild(autoAllBtn);
+    autoBox.appendChild(el('p', 'ae-hint', '每帧按原版比例重算落点 + 整组锚原版。先点它打底, 飘的帧再逐帧拖。'));
+
     // ── 模式: 拖单帧 / 拖整组 ─────────────────────────────────────────────────────
     const modeBox = el('div', 'ae-modebtns');
     const mFrame = el('button', 'btn on', '拖单帧');
@@ -267,6 +278,19 @@ export function openAlignEditor(opts: AlignEditorOpts): Promise<SegmentEdit | nu
     mFrame.addEventListener('click', () => { mode = 'frame'; mFrame.classList.add('on'); mGroup.classList.remove('on'); });
     mGroup.addEventListener('click', () => { mode = 'group'; mGroup.classList.add('on'); mFrame.classList.remove('on'); });
     modeBox.append(mFrame, mGroup);
+
+    // ── 方向 pad (鼠标党微调, 按当前模式动单帧/整组; Shift+点 ×10, 同键盘) ───────────────────────────
+    const padBox = el('div', 'ae-pad');
+    const padBtn = (label: string, vx: number, vy: number): HTMLButtonElement => {
+      const b = el('button', 'btn', label);
+      b.addEventListener('click', (ev) => { const m = (ev as MouseEvent).shiftKey ? 10 : 1; nudge(vx * m, vy * m); });
+      return b;
+    };
+    padBox.append(
+      el('span'), padBtn('↑', 0, -1), el('span'),
+      padBtn('←', -1, 0), el('span', 'ae-padc', '微调'), padBtn('→', 1, 0),
+      el('span'), padBtn('↓', 0, 1), el('span'),
+    );
 
     // ── 洋葱皮控制 ────────────────────────────────────────────────────────────────
     function chk(label: string, init: boolean, on: (v: boolean) => void): HTMLElement {
@@ -290,13 +314,13 @@ export function openAlignEditor(opts: AlignEditorOpts): Promise<SegmentEdit | nu
     // ── 对齐原版 (整组) + 重置视图 ───────────────────────────────────────────────
     const alignBox = el('div', 'algo');
     alignBox.appendChild(el('span', 'lbl', '整组锚原版 (大差不差即可, 别逐帧贴)'));
-    const autoBtn = el('button', 'btn block', '一键对齐原版');
+    const autoBtn = el('button', 'btn block', '整组对齐原版');
     autoBtn.addEventListener('click', () => {
       work.groupOffset = autoGroupOffset(work, opts.meta);
       redraw(); restartPreview();
     });
     alignBox.appendChild(autoBtn);
-    alignBox.appendChild(el('p', 'ae-hint', '或切「拖整组」在画布上拖到大致贴原版。'));
+    alignBox.appendChild(el('p', 'ae-hint', '只平移整组(不动单帧相对位置)。或切「拖整组」在画布上拖到大致贴原版。'));
     const resetBtn = el('button', 'btn block', '重置视图 (帧拖出框时用)');
     resetBtn.addEventListener('click', () => { editGeo = computeEditGeo(); mainCv.width = editGeo.cellW; mainCv.height = editGeo.cellH; redraw(); });
     alignBox.appendChild(resetBtn);
@@ -338,6 +362,20 @@ export function openAlignEditor(opts: AlignEditorOpts): Promise<SegmentEdit | nu
       timers.push(animate(origCv, opts.origSS, cellsP, opts.bg));
     }
 
+    // ── ✨一键自动对齐: 自动打底 (逐帧 proportional 重算 relAxis + 整组锚原版), 再交手工兜底 ──────────
+    // 异形无银弹 → 这只保证"同体型够用 + 给个好起点"; 飘的帧仍靠拖拽/方向键/pad 收尾。sprite 不动 (只挪轴, 缩略图无需刷)。
+    const cellByKey = new Map(opts.meta.cells.map((c) => [`${c.g},${c.i}`, c]));
+    function autoAlignAll(): void {
+      for (const f of frames) {
+        const cell = cellByKey.get(`${f.g},${f.i}`);
+        if (cell) f.relAxis = autoAlignRelAxis(f.sprite.width, f.sprite.height, cell);
+      }
+      work.groupOffset = autoGroupOffset(work, opts.meta); // 逐帧打底后再整组锚原版 (两层独立)
+      editGeo = computeEditGeo();                           // 帧动了 → 重算视图免拖出框
+      mainCv.width = editGeo.cellW; mainCv.height = editGeo.cellH;
+      redraw(); restartPreview();
+    }
+
     // ── 键盘: ←→↑↓ 微调 (Shift×10), Esc 取消, Enter 确认 ─────────────────────────
     function nudge(vx: number, vy: number): void {
       if (mode === 'group') work.groupOffset = [work.groupOffset[0] - vx, work.groupOffset[1] - vy];
@@ -357,10 +395,12 @@ export function openAlignEditor(opts: AlignEditorOpts): Promise<SegmentEdit | nu
     }
 
     // ── 装配右栏 ──────────────────────────────────────────────────────────────────
+    side.appendChild(autoBox); // ✨一键自动对齐 = 最醒目, 放最前 (先自动打底)
     side.appendChild(el('span', 'lbl', '帧 (点选要调的帧)'));
     side.appendChild(strip);
     side.appendChild(frameLbl);
     side.appendChild(modeBox);
+    side.appendChild(padBox);
     side.appendChild(onionBox);
     side.appendChild(alignBox);
     side.appendChild(prevs);
